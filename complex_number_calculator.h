@@ -1,6 +1,8 @@
 #ifndef COMPLEX_NUMBER_CALCULATOR_H
 #define COMPLEX_NUMBER_CALCULATOR_H
 
+#include<math.h>
+
 class ComplexNumberCalculator {
 public:
     double calculateMagnitude(double real, double imaginary);
