@@ -1,0 +1,16 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "build",
+			"type": "shell",
+			"command": "gcc",
+			"args": [
+				"-o",
+				"/home/physics/phucbb/Documents/physics/Assignment 4",
+				"/home/physics/phucbb/Documents/physics/Assignment 4/Start.c"
+			],
+			"group": "build"
+		}
+	]
+}
