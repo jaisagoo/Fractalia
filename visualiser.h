@@ -23,12 +23,24 @@ private:
         double escapeRadius = 2.0;
         double juliaReal = -0.8;        // Julia constant c (ignored for the Mandelbrot set).
         double juliaImaginary = 0.156;
+        MandelbrotFormula formula;      // z -> a z^b + c z + d from z0 (Mandelbrot only).
+        ColourSettings colouring;       // How points outside the set are coloured.
     };
 
     enum class SetType {
         Mandelbrot,
         Julia
     };
+
+    // The values a parameter's slider runs between, chosen by the user (like Desmos).
+    struct SliderRange {
+        double minimum = 0.0;
+        double maximum = 1.0;
+    };
+
+    // Centre re/im, zoom, iterations, escape radius, colour cycle, Julia c re/im, then Mandelbrot
+    // formula constants a re/im, exponent b, c re/im, z0 re/im.
+    static constexpr int fieldCount = 15;
 
     struct RenderRequest {
         View view;
@@ -53,26 +65,54 @@ private:
 
     static LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
     static LRESULT CALLBACK canvasProcedure(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
+    static LRESULT CALLBACK panelProcedure(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
+    static LRESULT CALLBACK sliderProcedure(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
     static DWORD WINAPI renderThreadEntry(LPVOID parameter);
     LRESULT handleWindowMessage(UINT message, WPARAM wParam, LPARAM lParam);
     LRESULT handleCanvasMessage(UINT message, WPARAM wParam, LPARAM lParam);
+    LRESULT handlePanelMessage(UINT message, WPARAM wParam, LPARAM lParam);
+    LRESULT handleSliderMessage(HWND slider, int field, UINT message, WPARAM wParam, LPARAM lParam);
 
     void createResources();
     void createControls();
-    void layoutCanvas(int clientWidth, int clientHeight);
+    void layoutCanvas();
     void paintMenu(HDC deviceContext);
     void drawButton(const DRAWITEMSTRUCT& item);
     void paintCanvas();
 
-    int visibleFieldCount() const;
+    int fieldTop(int field) const;
+    int colouringRowTop() const;
+    int formulaHeadingTop() const;
+    bool isFieldVisible(int field) const;
+    int fieldsBottom() const;
+    RECT valueBoxRect(int field) const;
+    RECT minimumBoxRect(int field) const;
+    RECT maximumBoxRect(int field) const;
+    RECT sliderRect(int field) const;
     void layoutMenu();
-    void drawSetButton(const DRAWITEMSTRUCT& item);
+    void positionMenuControls();
+    void scrollMenuTo(int position);
+    void scrollMenuToShow(RECT area);
+    void invalidateMenuArea(RECT area);
+    void drawToggleButton(const DRAWITEMSTRUCT& item, bool selected);
+    void paintSlider(HWND slider, int field);
     bool readInputs();
+    bool parseField(int field, double& value) const;
+    double fieldValue(int field) const;
+    void setFieldValue(int field, double value);
+    void onValueEdited(int field);
+    void onRangeEdited(int field);
+    double sliderFraction(int field) const;
+    void setFieldFromSlider(int field, double fraction);
+    SliderRange& range(int field);
+    static SliderRange defaultRange(SetType type, int field);
     static View defaultView(SetType type);
     void switchSet(SetType type);
     void openJuliaAt(int cursorX, int cursorY);
     void writeInputs();
     void writePositionInputs();
+    void writeField(int field);
+    void writeRange(int field);
     void requestRender();
     void startRenderThread();
     void stopRenderThread();
@@ -89,18 +129,24 @@ private:
     HWND titleLabel_ = nullptr;
     HWND hintLabel_ = nullptr;
     HWND statusLabel_ = nullptr;
+    HWND formulaLabel_ = nullptr;
+    HWND colouringLabel_ = nullptr;
+    HWND smoothButton_ = nullptr;
+    HWND bandsButton_ = nullptr;
     HWND mandelbrotButton_ = nullptr;
     HWND juliaButton_ = nullptr;
     HWND renderButton_ = nullptr;
     HWND resetButton_ = nullptr;
-    HWND centerRealInput_ = nullptr;
-    HWND centerImaginaryInput_ = nullptr;
-    HWND zoomInput_ = nullptr;
-    HWND iterationsInput_ = nullptr;
-    HWND escapeRadiusInput_ = nullptr;
-    HWND juliaRealInput_ = nullptr;
-    HWND juliaImaginaryInput_ = nullptr;
-    HWND fieldLabels_[7] = {};
+    HWND panel_ = nullptr;                      // Scrollable container for the whole menu.
+    HWND fieldLabels_[fieldCount] = {};
+    HWND valueInputs_[fieldCount] = {};
+    HWND minimumInputs_[fieldCount] = {};       // Left end of each slider.
+    HWND maximumInputs_[fieldCount] = {};       // Right end of each slider.
+    HWND sliders_[fieldCount] = {};
+    int menuScroll_ = 0;                        // Pixels the menu is scrolled down by.
+    int menuVisibleHeight_ = 0;
+    int canvasLeft_ = 0;
+    bool writingInputs_ = false;                // Ignore EN_CHANGE while the program sets text.
 
     HFONT font_ = nullptr;
     HFONT titleFont_ = nullptr;
@@ -112,6 +158,7 @@ private:
     View view_;
     SetType setType_ = SetType::Mandelbrot;
     View savedViews_[2];  // The last view of each set, indexed by SetType.
+    SliderRange ranges_[2][fieldCount];  // Slider ranges for each set.
     RenderedImage displayedImage_;  // UI thread only.
     unsigned int latestRequestId_ = 0;
 

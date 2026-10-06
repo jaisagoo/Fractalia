@@ -52,20 +52,77 @@ struct RenderJob {
     bool julia;
     double constantReal;
     double constantImaginary;
+    MandelbrotFormula formula;   // Mandelbrot only.
+    bool classicFormula;
+    ColourSettings colouring;
     std::atomic<int> nextRow;
     std::atomic<bool> aborted;
 };
 
-std::uint32_t colourFor(int iterations, int maxIterations) {
-    if (iterations >= maxIterations) {
-        return 0x00100B2A;
+// A looping gradient (deep blue -> blue -> near white -> orange -> crimson -> back), precomputed
+// into a table. 32-bit DIB pixels are laid out as 0x00RRGGBB.
+constexpr int paletteSize = 2048;
+
+const std::uint32_t* palette() {
+    static std::uint32_t table[paletteSize];
+    static bool built = false;
+    if (!built) {
+        struct Stop { double position; double red, green, blue; };
+        const Stop stops[] = {
+            {0.00, 0, 7, 100}, {0.16, 32, 107, 203}, {0.42, 237, 255, 255}, {0.6425, 255, 170, 0},
+            {0.8575, 160, 30, 50}, {1.00, 0, 7, 100},
+        };
+        for (int index = 0; index < paletteSize; ++index) {
+            const double position = static_cast<double>(index) / paletteSize;
+            int stop = 0;
+            while (stops[stop + 1].position < position) {
+                ++stop;
+            }
+            const Stop& from = stops[stop];
+            const Stop& to = stops[stop + 1];
+            double t = (position - from.position) / (to.position - from.position);
+            t = t * t * (3.0 - 2.0 * t);  // Ease between stops so the gradient has no visible kinks.
+            const auto channel = [t](double a, double b) {
+                return static_cast<std::uint32_t>(a + (b - a) * t + 0.5);
+            };
+            table[index] = (channel(from.red, to.red) << 16) | (channel(from.green, to.green) << 8) |
+                channel(from.blue, to.blue);
+        }
+        built = true;
     }
-    const double shade = static_cast<double>(iterations) / maxIterations;
-    const auto red = static_cast<std::uint32_t>(25.0 + 230.0 * shade);
-    const auto green = static_cast<std::uint32_t>(35.0 + 170.0 * shade * shade);
-    const auto blue = static_cast<std::uint32_t>(70.0 + 180.0 * (1.0 - shade));
-    // 32-bit DIB pixels are laid out as 0x00RRGGBB.
-    return (red << 16) | (green << 8) | blue;
+    return table;
+}
+
+std::uint32_t colourFor(int iterations, double smoothCount, int maxIterations, const ColourSettings& colouring) {
+    if (iterations >= maxIterations) {
+        return 0x00100B2A;  // Inside the set.
+    }
+    const double count = colouring.smooth ? smoothCount : static_cast<double>(iterations);
+    double position = count / std::max(1e-9, colouring.cycleLength);
+    position -= std::floor(position);
+    const int index = std::min(paletteSize - 1, std::max(0, static_cast<int>(position * paletteSize)));
+    return palette()[index];
+}
+
+// The continuous escape count for an orbit that has just escaped at step `count` with value z.
+// The orbit is followed a few more steps until |z| is large (where |z| grows like |z|^degree each
+// step), then the fractional part comes from where |z| lies between successive steps.
+template <typename Step>
+double smoothEscapeCount(int count, double zReal, double zImaginary, double escapeRadius, double degree,
+    Step step) {
+    const double bigRadius = std::max(1000.0, escapeRadius);
+    const double bigSquared = bigRadius * bigRadius;
+    int steps = count;
+    for (int extra = 0; extra < 64 && zReal * zReal + zImaginary * zImaginary < bigSquared; ++extra) {
+        step(zReal, zImaginary);
+        ++steps;
+    }
+    const double sizeSquared = zReal * zReal + zImaginary * zImaginary;
+    if (degree <= 1.0 || !(sizeSquared > 1.0) || !std::isfinite(sizeSquared)) {
+        return steps;
+    }
+    const double logSize = 0.5 * std::log(sizeSquared);
+    return steps + 1.0 - std::log(logSize / std::log(bigRadius)) / std::log(degree);
 }
 
 // Each worker repeatedly claims the next unrendered sample row, so threads that get cheap rows
@@ -95,11 +152,17 @@ void renderRows(RenderJob& job) {
                 continue;
             }
             const double real = job.left + x * job.pixelWidth;
+            double smoothCount = 0.0;
+            double* smoothOutput = job.colouring.smooth ? &smoothCount : nullptr;
             const int iterations = job.julia
                 ? job.calculator->escapeIterationsJulia(real, imaginary, job.constantReal,
-                    job.constantImaginary, job.maxIterations, job.escapeRadius)
-                : job.calculator->escapeIterations(real, imaginary, job.maxIterations, job.escapeRadius);
-            const std::uint32_t colour = colourFor(iterations, job.maxIterations);
+                    job.constantImaginary, job.maxIterations, job.escapeRadius, smoothOutput)
+                : job.classicFormula
+                ? job.calculator->escapeIterations(real, imaginary, job.maxIterations, job.escapeRadius,
+                    smoothOutput)
+                : job.calculator->escapeIterationsGeneral(real, imaginary, job.formula, job.maxIterations,
+                    job.escapeRadius, smoothOutput);
+            const std::uint32_t colour = colourFor(iterations, smoothCount, job.maxIterations, job.colouring);
             const int blockWidth = std::min(step, job.width - x);
             for (int blockRow = 0; blockRow < blockHeight; ++blockRow) {
                 std::fill_n(row + static_cast<std::size_t>(blockRow) * job.width + x, blockWidth, colour);
@@ -154,7 +217,8 @@ DWORD WINAPI renderThread(LPVOID parameter) {
 #endif
 }
 
-int FractalCalculator::escapeIterations(double real, double imaginary, int maxIterations, double escapeRadius) const {
+int FractalCalculator::escapeIterations(double real, double imaginary, int maxIterations, double escapeRadius,
+    double* smoothCount) const {
     // Every orbit of a point in the set stays within |z| <= 2, so the shortcut is only exact
     // when the escape radius is at least 2.
     if (escapeRadius >= 2.0 && inMainCardioidOrBulb(real, imaginary)) {
@@ -181,6 +245,14 @@ int FractalCalculator::escapeIterations(double real, double imaginary, int maxIt
         zImaginarySquared = zImaginary * zImaginary;
 
         if (zRealSquared + zImaginarySquared > escapeSquared) {
+            if (smoothCount != nullptr) {
+                *smoothCount = smoothEscapeCount(iteration + 1, zReal, zImaginary, escapeRadius, 2.0,
+                    [real, imaginary](double& re, double& im) {
+                        const double nextReal = re * re - im * im + real;
+                        im = 2.0 * re * im + imaginary;
+                        re = nextReal;
+                    });
+            }
             return iteration + 1;
         }
 
@@ -199,7 +271,7 @@ int FractalCalculator::escapeIterations(double real, double imaginary, int maxIt
 }
 
 int FractalCalculator::escapeIterationsJulia(double real, double imaginary, double constantReal,
-    double constantImaginary, int maxIterations, double escapeRadius) const {
+    double constantImaginary, int maxIterations, double escapeRadius, double* smoothCount) const {
     const double escapeSquared = escapeRadius * escapeRadius;
     double zReal = real;
     double zImaginary = imaginary;
@@ -217,6 +289,140 @@ int FractalCalculator::escapeIterationsJulia(double real, double imaginary, doub
         zImaginarySquared = zImaginary * zImaginary;
 
         if (zRealSquared + zImaginarySquared > escapeSquared) {
+            if (smoothCount != nullptr) {
+                *smoothCount = smoothEscapeCount(iteration + 1, zReal, zImaginary, escapeRadius, 2.0,
+                    [constantReal, constantImaginary](double& re, double& im) {
+                        const double nextReal = re * re - im * im + constantReal;
+                        im = 2.0 * re * im + constantImaginary;
+                        re = nextReal;
+                    });
+            }
+            return iteration + 1;
+        }
+        if (std::fabs(zReal - savedReal) < 1e-15 && std::fabs(zImaginary - savedImaginary) < 1e-15) {
+            return maxIterations;
+        }
+        if (++stepsSinceSave == checkInterval) {
+            stepsSinceSave = 0;
+            checkInterval *= 2;
+            savedReal = zReal;
+            savedImaginary = zImaginary;
+        }
+    }
+    return maxIterations;
+}
+
+namespace {
+// z^n for a whole number n, by repeated squaring. Negative n gives 1 / z^|n|.
+void integerPower(double& real, double& imaginary, long exponent) {
+    const bool invert = exponent < 0;
+    unsigned long remaining = static_cast<unsigned long>(invert ? -exponent : exponent);
+    double resultReal = 1.0;
+    double resultImaginary = 0.0;
+    double baseReal = real;
+    double baseImaginary = imaginary;
+    while (remaining > 0) {
+        if (remaining & 1UL) {
+            const double nextReal = resultReal * baseReal - resultImaginary * baseImaginary;
+            resultImaginary = resultReal * baseImaginary + resultImaginary * baseReal;
+            resultReal = nextReal;
+        }
+        remaining >>= 1;
+        if (remaining > 0) {
+            const double nextReal = baseReal * baseReal - baseImaginary * baseImaginary;
+            baseImaginary = 2.0 * baseReal * baseImaginary;
+            baseReal = nextReal;
+        }
+    }
+    if (invert) {
+        const double size = resultReal * resultReal + resultImaginary * resultImaginary;
+        resultReal /= size;
+        resultImaginary = -resultImaginary / size;
+    }
+    real = resultReal;
+    imaginary = resultImaginary;
+}
+
+// z^b for any real b, using the principal branch (angle in (-pi, pi]).
+void realPower(double& real, double& imaginary, double exponent) {
+    const double size = std::sqrt(real * real + imaginary * imaginary);
+    if (size == 0.0) {
+        real = exponent > 0.0 ? 0.0 : (exponent == 0.0 ? 1.0 : HUGE_VAL);
+        imaginary = 0.0;
+        return;
+    }
+    const double newSize = std::pow(size, exponent);
+    const double newAngle = exponent * std::atan2(imaginary, real);
+    real = newSize * std::cos(newAngle);
+    imaginary = newSize * std::sin(newAngle);
+}
+}
+
+// The general iteration z -> a z^b + c z + d from z = start, with d the point being tested. The
+// cardioid/bulb shortcut only holds for the classic formula, but cycle detection still works for
+// any fixed map.
+int FractalCalculator::escapeIterationsGeneral(double real, double imaginary, const MandelbrotFormula& formula,
+    int maxIterations, double escapeRadius, double* smoothCount) const {
+    const double aReal = formula.aReal;
+    const double aImaginary = formula.aImaginary;
+    const double cReal = formula.cReal;
+    const double cImaginary = formula.cImaginary;
+    const double exponent = formula.exponent;
+    const double roundedExponent = std::round(exponent);
+    const bool wholeExponent = std::fabs(exponent - roundedExponent) < 1e-12 && std::fabs(roundedExponent) <= 1e6;
+    const long integerExponent = static_cast<long>(roundedExponent);
+
+    // Past a large enough |z|, the a z^b term outgrows everything else and |z| increases every
+    // step, so the orbit must escape. Below that an orbit can still come back, so the escape test
+    // never uses a smaller radius. (Only possible for b > 1; otherwise the user's radius is used.)
+    const double aSize = std::sqrt(aReal * aReal + aImaginary * aImaginary);
+    const double cSize = std::sqrt(cReal * cReal + cImaginary * cImaginary);
+    const double dSize = std::sqrt(real * real + imaginary * imaginary);
+    double radius = escapeRadius;
+    if (aSize > 1e-12 && exponent > 1.0) {
+        const double linear = 1.0 + cSize;
+        if (exponent == 2.0) {
+            // Exact root of |a| r^2 - (1 + |c|) r - |d| = 0.
+            radius = std::max(radius, (linear + std::sqrt(linear * linear + 4.0 * aSize * dSize)) / (2.0 * aSize));
+        } else {
+            // Enough that |a| r^b >= 2 (1 + |c|) r and |a| r^b >= 2 |d|.
+            radius = std::max(radius, std::pow(2.0 * linear / aSize, 1.0 / (exponent - 1.0)));
+            radius = std::max(radius, std::pow(2.0 * dSize / aSize, 1.0 / exponent));
+        }
+    }
+    const double escapeSquared = radius * radius;
+
+    double zReal = formula.startReal;
+    double zImaginary = formula.startImaginary;
+    double savedReal = zReal;
+    double savedImaginary = zImaginary;
+    int checkInterval = 8;
+    int stepsSinceSave = 0;
+
+    // One step of z -> a z^b + c z + d.
+    const auto step = [&](double& re, double& im) {
+        double powerReal = re;
+        double powerImaginary = im;
+        if (wholeExponent) {
+            integerPower(powerReal, powerImaginary, integerExponent);
+        } else {
+            realPower(powerReal, powerImaginary, exponent);
+        }
+        const double nextReal = aReal * powerReal - aImaginary * powerImaginary +
+            cReal * re - cImaginary * im + real;
+        im = aReal * powerImaginary + aImaginary * powerReal + cReal * im + cImaginary * re + imaginary;
+        re = nextReal;
+    };
+
+    for (int iteration = 0; iteration < maxIterations; ++iteration) {
+        step(zReal, zImaginary);
+
+        // Also catches overflow/NaN (e.g. a negative exponent at z = 0): treat it as escaped.
+        const double sizeSquared = zReal * zReal + zImaginary * zImaginary;
+        if (!(sizeSquared <= escapeSquared)) {
+            if (smoothCount != nullptr) {
+                *smoothCount = smoothEscapeCount(iteration + 1, zReal, zImaginary, radius, exponent, step);
+            }
             return iteration + 1;
         }
         if (std::fabs(zReal - savedReal) < 1e-15 && std::fabs(zImaginary - savedImaginary) < 1e-15) {
@@ -234,8 +440,8 @@ int FractalCalculator::escapeIterationsJulia(double real, double imaginary, doub
 
 bool FractalCalculator::renderMandelbrot(std::vector<std::uint32_t>& pixels, int width, int height,
     double centerReal, double centerImaginary, double zoom,
-    int maxIterations, double escapeRadius, const std::atomic<bool>* cancel,
-    int step, bool reuseCoarser) const {
+    int maxIterations, double escapeRadius, const MandelbrotFormula& formula,
+    const ColourSettings& colouring, const std::atomic<bool>* cancel, int step, bool reuseCoarser) const {
     if (width < 1 || height < 1) {
         pixels.clear();
         return true;
@@ -267,6 +473,9 @@ bool FractalCalculator::renderMandelbrot(std::vector<std::uint32_t>& pixels, int
     job.julia = false;
     job.constantReal = 0.0;
     job.constantImaginary = 0.0;
+    job.formula = formula;
+    job.classicFormula = formula.isClassic();
+    job.colouring = colouring;
     job.nextRow.store(0);
     job.aborted.store(false);
 
@@ -276,7 +485,7 @@ bool FractalCalculator::renderMandelbrot(std::vector<std::uint32_t>& pixels, int
 bool FractalCalculator::renderJulia(std::vector<std::uint32_t>& pixels, int width, int height,
     double centerReal, double centerImaginary, double zoom,
     double constantReal, double constantImaginary, int maxIterations, double escapeRadius,
-    const std::atomic<bool>* cancel, int step, bool reuseCoarser) const {
+    const ColourSettings& colouring, const std::atomic<bool>* cancel, int step, bool reuseCoarser) const {
     if (width < 1 || height < 1) {
         pixels.clear();
         return true;
@@ -308,6 +517,9 @@ bool FractalCalculator::renderJulia(std::vector<std::uint32_t>& pixels, int widt
     job.julia = true;
     job.constantReal = constantReal;
     job.constantImaginary = constantImaginary;
+    job.formula = MandelbrotFormula();
+    job.classicFormula = true;
+    job.colouring = colouring;
     job.nextRow.store(0);
     job.aborted.store(false);
     return runRenderJob(job);
