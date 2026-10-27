@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 // The Mandelbrot iteration z(n+1) = a z(n)^b + c z(n) + d, starting from z(0) = start, where d is
@@ -44,6 +45,11 @@ public:
     int escapeIterationsJulia(double real, double imaginary, double constantReal, double constantImaginary,
         int maxIterations, double escapeRadius, double* smoothCount = nullptr) const;
 
+    // Lyapunov exponent of the logistic map x -> r x (1 - x), where r is a or b depending on the
+    // next letter of the (repeating) sequence. Negative = stable, positive = chaotic.
+    double lyapunovExponent(double a, double b, const std::string& sequence, int warmup,
+        int iterations) const;
+
     // Renders width x height pixels (0x00RRGGBB) using every CPU core. If cancel is given and becomes
     // true part-way through, rendering stops early and the function returns false.
     //
@@ -59,6 +65,11 @@ public:
         double centerReal, double centerImaginary, double zoom,
         double constantReal, double constantImaginary, int maxIterations, double escapeRadius,
         const ColourSettings& colouring, const std::atomic<bool>* cancel = nullptr, int step = 1,
+        bool reuseCoarser = false) const;
+    // Same view mapping as the others, but the horizontal axis is a and the vertical axis is b.
+    bool renderLyapunov(std::vector<std::uint32_t>& pixels, int width, int height,
+        double centerA, double centerB, double zoom, const std::string& sequence, int warmup,
+        int iterations, const std::atomic<bool>* cancel = nullptr, int step = 1,
         bool reuseCoarser = false) const;
 };
 

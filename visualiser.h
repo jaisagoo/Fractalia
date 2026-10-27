@@ -25,12 +25,16 @@ private:
         double juliaImaginary = 0.156;
         MandelbrotFormula formula;      // z -> a z^b + c z + d from z0 (Mandelbrot only).
         ColourSettings colouring;       // How points outside the set are coloured.
+        std::string sequence = "AB";    // Lyapunov only: which of a, b to use at each step.
+        int warmup = 200;               // Lyapunov only: steps thrown away before measuring.
     };
 
     enum class SetType {
         Mandelbrot,
-        Julia
+        Julia,
+        Lyapunov
     };
+    static constexpr int setTypeCount = 3;
 
     // The values a parameter's slider runs between, chosen by the user (like Desmos).
     struct SliderRange {
@@ -39,8 +43,8 @@ private:
     };
 
     // Centre re/im, zoom, iterations, escape radius, colour cycle, Julia c re/im, then Mandelbrot
-    // formula constants a re/im, exponent b, c re/im, z0 re/im.
-    static constexpr int fieldCount = 15;
+    // formula constants a re/im, exponent b, c re/im, z0 re/im, then the Lyapunov warm-up.
+    static constexpr int fieldCount = 16;
 
     struct RenderRequest {
         View view;
@@ -83,6 +87,8 @@ private:
     int fieldTop(int field) const;
     int colouringRowTop() const;
     int formulaHeadingTop() const;
+    int sequenceRowTop() const;
+    RECT sequenceBoxRect() const;
     bool isFieldVisible(int field) const;
     int fieldsBottom() const;
     RECT valueBoxRect(int field) const;
@@ -98,10 +104,14 @@ private:
     void paintSlider(HWND slider, int field);
     bool readInputs();
     bool parseField(int field, double& value) const;
+    const char* fieldLabel(int field) const;
     double fieldValue(int field) const;
     void setFieldValue(int field, double value);
     void onValueEdited(int field);
     void onRangeEdited(int field);
+    bool parseSequence(std::string& sequence) const;
+    void onSequenceEdited();
+    void writeSequence();
     double sliderFraction(int field) const;
     void setFieldFromSlider(int field, double fraction);
     SliderRange& range(int field);
@@ -135,6 +145,9 @@ private:
     HWND bandsButton_ = nullptr;
     HWND mandelbrotButton_ = nullptr;
     HWND juliaButton_ = nullptr;
+    HWND lyapunovButton_ = nullptr;
+    HWND sequenceLabel_ = nullptr;
+    HWND sequenceInput_ = nullptr;
     HWND renderButton_ = nullptr;
     HWND resetButton_ = nullptr;
     HWND panel_ = nullptr;                      // Scrollable container for the whole menu.
@@ -157,8 +170,8 @@ private:
 
     View view_;
     SetType setType_ = SetType::Mandelbrot;
-    View savedViews_[2];  // The last view of each set, indexed by SetType.
-    SliderRange ranges_[2][fieldCount];  // Slider ranges for each set.
+    View savedViews_[setTypeCount];  // The last view of each set, indexed by SetType.
+    SliderRange ranges_[setTypeCount][fieldCount];  // Slider ranges for each set.
     RenderedImage displayedImage_;  // UI thread only.
     unsigned int latestRequestId_ = 0;
 

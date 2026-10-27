@@ -55,6 +55,9 @@ struct RenderJob {
     MandelbrotFormula formula;   // Mandelbrot only.
     bool classicFormula;
     ColourSettings colouring;
+    bool lyapunov;
+    std::string sequence;        // Lyapunov only.
+    int warmup;
     std::atomic<int> nextRow;
     std::atomic<bool> aborted;
 };
@@ -102,6 +105,23 @@ std::uint32_t colourFor(int iterations, double smoothCount, int maxIterations, c
     position -= std::floor(position);
     const int index = std::min(paletteSize - 1, std::max(0, static_cast<int>(position * paletteSize)));
     return palette()[index];
+}
+
+// Stable points fade from black to gold and chaotic ones from black to blue, so the edges where
+// the exponent crosses 0 come out black.
+std::uint32_t lyapunovColour(double exponent) {
+    if (std::isnan(exponent) || exponent == HUGE_VAL) {
+        return 0x00100B2A;  // x ran off to infinity (a or b outside [0, 4]).
+    }
+    const auto rgb = [](double t, double red, double green, double blue) {
+        t = std::sqrt(std::max(0.0, std::min(1.0, t)));
+        return (static_cast<std::uint32_t>(red * t) << 16) | (static_cast<std::uint32_t>(green * t) << 8) |
+            static_cast<std::uint32_t>(blue * t);
+    };
+    if (exponent <= 0.0) {
+        return rgb(1.0 - std::exp(exponent), 255, 200, 40);
+    }
+    return rgb(1.0 - std::exp(-2.0 * exponent), 30, 90, 255);
 }
 
 // The continuous escape count for an orbit that has just escaped at step `count` with value z.
@@ -152,17 +172,24 @@ void renderRows(RenderJob& job) {
                 continue;
             }
             const double real = job.left + x * job.pixelWidth;
-            double smoothCount = 0.0;
-            double* smoothOutput = job.colouring.smooth ? &smoothCount : nullptr;
-            const int iterations = job.julia
-                ? job.calculator->escapeIterationsJulia(real, imaginary, job.constantReal,
-                    job.constantImaginary, job.maxIterations, job.escapeRadius, smoothOutput)
-                : job.classicFormula
-                ? job.calculator->escapeIterations(real, imaginary, job.maxIterations, job.escapeRadius,
-                    smoothOutput)
-                : job.calculator->escapeIterationsGeneral(real, imaginary, job.formula, job.maxIterations,
-                    job.escapeRadius, smoothOutput);
-            const std::uint32_t colour = colourFor(iterations, smoothCount, job.maxIterations, job.colouring);
+            std::uint32_t colour = 0;
+            if (job.lyapunov) {
+                // real = a, imaginary = b
+                colour = lyapunovColour(job.calculator->lyapunovExponent(real, imaginary, job.sequence,
+                    job.warmup, job.maxIterations));
+            } else {
+                double smoothCount = 0.0;
+                double* smoothOutput = job.colouring.smooth ? &smoothCount : nullptr;
+                const int iterations = job.julia
+                    ? job.calculator->escapeIterationsJulia(real, imaginary, job.constantReal,
+                        job.constantImaginary, job.maxIterations, job.escapeRadius, smoothOutput)
+                    : job.classicFormula
+                    ? job.calculator->escapeIterations(real, imaginary, job.maxIterations, job.escapeRadius,
+                        smoothOutput)
+                    : job.calculator->escapeIterationsGeneral(real, imaginary, job.formula, job.maxIterations,
+                        job.escapeRadius, smoothOutput);
+                colour = colourFor(iterations, smoothCount, job.maxIterations, job.colouring);
+            }
             const int blockWidth = std::min(step, job.width - x);
             for (int blockRow = 0; blockRow < blockHeight; ++blockRow) {
                 std::fill_n(row + static_cast<std::size_t>(blockRow) * job.width + x, blockWidth, colour);
@@ -476,6 +503,8 @@ bool FractalCalculator::renderMandelbrot(std::vector<std::uint32_t>& pixels, int
     job.formula = formula;
     job.classicFormula = formula.isClassic();
     job.colouring = colouring;
+    job.lyapunov = false;
+    job.warmup = 0;
     job.nextRow.store(0);
     job.aborted.store(false);
 
@@ -520,9 +549,98 @@ bool FractalCalculator::renderJulia(std::vector<std::uint32_t>& pixels, int widt
     job.formula = MandelbrotFormula();
     job.classicFormula = true;
     job.colouring = colouring;
+    job.lyapunov = false;
+    job.warmup = 0;
     job.nextRow.store(0);
     job.aborted.store(false);
     return runRenderJob(job);
 }
 
+double FractalCalculator::lyapunovExponent(double a, double b, const std::string& sequence, int warmup,
+    int iterations) const {
+    if (sequence.empty() || iterations < 1) {
+        return 0.0;
+    }
+    const std::size_t length = sequence.size();
+    std::size_t position = 0;
+    double x = 0.5;
+
+    for (int i = 0; i < warmup; ++i) {
+        const double r = sequence[position] == 'A' ? a : b;
+        x = r * x * (1.0 - x);
+        if (++position == length) {
+            position = 0;
+        }
+    }
+
+    // lambda = average of log|r (1 - 2x)|. Calling log every step is slow, so multiply the
+    // derivatives up and only take the log when the product gets very big or very small.
+    double sum = 0.0;
+    double product = 1.0;
+    for (int i = 0; i < iterations; ++i) {
+        const double r = sequence[position] == 'A' ? a : b;
+        const double derivative = std::fabs(r * (1.0 - 2.0 * x));
+        if (derivative == 0.0) {
+            return -HUGE_VAL;  // superstable
+        }
+        product *= derivative;
+        if (product > 1e100 || product < 1e-100) {
+            sum += std::log(product);
+            product = 1.0;
+        }
+        x = r * x * (1.0 - x);
+        if (!std::isfinite(x)) {
+            return HUGE_VAL;
+        }
+        if (++position == length) {
+            position = 0;
+        }
+    }
+    return (sum + std::log(product)) / iterations;
+}
+
+bool FractalCalculator::renderLyapunov(std::vector<std::uint32_t>& pixels, int width, int height,
+    double centerA, double centerB, double zoom, const std::string& sequence, int warmup,
+    int iterations, const std::atomic<bool>* cancel, int step, bool reuseCoarser) const {
+    if (width < 1 || height < 1) {
+        pixels.clear();
+        return true;
+    }
+    const std::size_t pixelCount = static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
+    if (pixels.size() != pixelCount) {
+        pixels.assign(pixelCount, 0);
+        reuseCoarser = false;
+    }
+    step = std::max(1, step);
+    const double aspectRatio = static_cast<double>(width) / static_cast<double>(height);
+    const double viewHeight = 4.0 / zoom;
+    const double viewWidth = viewHeight * aspectRatio;
+
+    RenderJob job;
+    job.calculator = this;
+    job.pixels = pixels.data();
+    job.width = width;
+    job.height = height;
+    job.left = centerA - 0.5 * viewWidth;
+    job.top = centerB + 0.5 * viewHeight;
+    job.pixelWidth = width > 1 ? viewWidth / (width - 1) : 0.0;
+    job.pixelHeight = height > 1 ? viewHeight / (height - 1) : 0.0;
+    job.maxIterations = iterations;
+    job.escapeRadius = 0.0;
+    job.cancel = cancel;
+    job.step = step;
+    job.reuseCoarser = reuseCoarser;
+    job.julia = false;
+    job.constantReal = 0.0;
+    job.constantImaginary = 0.0;
+    job.formula = MandelbrotFormula();
+    job.classicFormula = true;
+    job.colouring = ColourSettings();
+    job.lyapunov = true;
+    job.sequence = sequence;
+    job.warmup = warmup;
+    job.nextRow.store(0);
+    job.aborted.store(false);
+    return runRenderJob(job);
+}
 

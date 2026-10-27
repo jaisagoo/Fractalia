@@ -20,6 +20,8 @@ constexpr int juliaButtonId = 1005;
 constexpr int smoothButtonId = 1007;
 constexpr int bandsButtonId = 1008;
 constexpr int panelId = 1006;
+constexpr int lyapunovButtonId = 1009;
+constexpr int sequenceInputId = 1010;
 constexpr int firstValueInputId = 2001;    // + field index
 constexpr int firstMinimumInputId = 2101;  // + field index
 constexpr int firstMaximumInputId = 2201;  // + field index
@@ -49,6 +51,7 @@ constexpr int selectorHeight = 32;
 constexpr int firstFieldTop = selectorTop + selectorHeight + 16;
 constexpr int fieldSpacing = 66;       // Each field: value row, then a [min] ---slider--- [max] row.
 constexpr int colouringRowHeight = 40;     // "Colouring  [Smooth | Bands]" switch row.
+constexpr int sequenceRowHeight = 40;      // "Sequence  [AB]" row (Lyapunov).
 constexpr int formulaHeadingHeight = 30;  // "Formula" heading above a, b, c and z0.
 constexpr int boxLeft = contentLeft + 150;
 constexpr int boxHeight = 28;
@@ -85,6 +88,7 @@ constexpr int cRealField = 11;
 constexpr int cImaginaryField = 12;
 constexpr int startRealField = 13;
 constexpr int startImaginaryField = 14;
+constexpr int warmupField = 15;          // Lyapunov only.
 
 struct FieldInfo {
     const char* label;
@@ -108,7 +112,10 @@ const FieldInfo fieldInfo[] = {
     {"c imaginary", false, false},
     {"Start z0 real", false, false},
     {"Start z0 imaginary", false, false},
+    {"Warm-up", false, true},
 };
+
+constexpr std::size_t maximumSequenceLength = 64;
 
 // Unscrolled rectangles of each part of a field whose row starts at `top`, in panel coordinates.
 RECT valueBoxAt(int top) {
@@ -202,8 +209,9 @@ Visualiser::Visualiser() : cancelRender_(false) {
     InitializeCriticalSection(&renderLock_);
     savedViews_[static_cast<int>(SetType::Mandelbrot)] = defaultView(SetType::Mandelbrot);
     savedViews_[static_cast<int>(SetType::Julia)] = defaultView(SetType::Julia);
+    savedViews_[static_cast<int>(SetType::Lyapunov)] = defaultView(SetType::Lyapunov);
     view_ = defaultView(SetType::Mandelbrot);
-    for (int type = 0; type < 2; ++type) {
+    for (int type = 0; type < setTypeCount; ++type) {
         for (int field = 0; field < fieldCount; ++field) {
             ranges_[type][field] = defaultRange(static_cast<SetType>(type), field);
         }
@@ -347,6 +355,7 @@ void Visualiser::createControls() {
     titleLabel_ = addLabel("FRACTAL PARAMETERS", titleFont_);
     mandelbrotButton_ = addButton("Mandelbrot", mandelbrotButtonId);
     juliaButton_ = addButton("Julia", juliaButtonId);
+    lyapunovButton_ = addButton("Lyapunov", lyapunovButtonId);
 
     // Creation order is also Tab order: value, slider minimum, slider, slider maximum.
     for (int field = 0; field < fieldCount; ++field) {
@@ -354,6 +363,15 @@ void Visualiser::createControls() {
             colouringLabel_ = addLabel("Colouring", font_);
             smoothButton_ = addButton("Smooth", smoothButtonId);
             bandsButton_ = addButton("Bands", bandsButtonId);
+        }
+        if (field == warmupField) {
+            sequenceLabel_ = addLabel("Sequence", font_);
+            sequenceInput_ = CreateWindowA("EDIT", "", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL |
+                ES_UPPERCASE, 0, 0, 1, 1, panel_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(sequenceInputId)),
+                instance, nullptr);
+            setFont(sequenceInput_, font_);
+            SendMessageA(sequenceInput_, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, 0);
+            SendMessageA(sequenceInput_, EM_LIMITTEXT, maximumSequenceLength, 0);
         }
         fieldLabels_[field] = addLabel(fieldInfo[field].label, font_);
         valueInputs_[field] = addEdit(firstValueInputId + field);
@@ -393,6 +411,16 @@ void Visualiser::layoutCanvas() {
 // Both sets show the view fields, the Colouring switch and the colour cycle; then Julia shows c,
 // and Mandelbrot shows its formula constants under a "Formula" heading.
 int Visualiser::fieldTop(int field) const {
+    if (setType_ == SetType::Lyapunov) {
+        // Centre a/b, zoom and iterations, then the sequence, then the warm-up.
+        if (field <= iterationsField) {
+            return firstFieldTop + field * fieldSpacing;
+        }
+        return field == warmupField ? sequenceRowTop() + sequenceRowHeight : -1;
+    }
+    if (field == warmupField) {
+        return -1;
+    }
     if (field <= escapeRadiusField) {
         return firstFieldTop + field * fieldSpacing;
     }
@@ -418,15 +446,25 @@ int Visualiser::formulaHeadingTop() const {
     return colouringRowTop() + colouringRowHeight + fieldSpacing;
 }
 
+int Visualiser::sequenceRowTop() const {
+    return firstFieldTop + (iterationsField + 1) * fieldSpacing;
+}
+
+RECT Visualiser::sequenceBoxRect() const {
+    return valueBoxAt(sequenceRowTop());
+}
+
 bool Visualiser::isFieldVisible(int field) const {
     return fieldTop(field) >= 0;
 }
 
 // Bottom of the last visible field row.
 int Visualiser::fieldsBottom() const {
-    return setType_ == SetType::Julia
-        ? fieldTop(juliaImaginaryField) + fieldSpacing
-        : formulaHeadingTop() + formulaHeadingHeight + (fieldCount - firstFormulaField) * fieldSpacing;
+    switch (setType_) {
+    case SetType::Julia: return fieldTop(juliaImaginaryField) + fieldSpacing;
+    case SetType::Lyapunov: return fieldTop(warmupField) + fieldSpacing;
+    default: return fieldTop(startImaginaryField) + fieldSpacing;
+    }
 }
 
 RECT Visualiser::valueBoxRect(int field) const { return valueBoxAt(fieldTop(field)); }
@@ -462,11 +500,19 @@ void Visualiser::layoutMenu() {
     canvasLeft_ = panelLeft + panelWidth + scrollBarWidth + margin;
     layoutCanvas();
 
-    SetWindowTextA(hintLabel_, setType_ == SetType::Mandelbrot
-        ? "Scroll over the image to zoom; right-drag to pan.\nDouble-click a point to open its Julia set.\n"
-          "Set each slider's range with the boxes at its ends."
-        : "Scroll over the image to zoom; right-drag to pan.\nJulia c is the constant in z = z^2 + c.\n"
-          "Set each slider's range with the boxes at its ends.");
+    const char* hint = "Scroll over the image to zoom; right-drag to pan.\nDouble-click a point to open its Julia set.\n"
+        "Set each slider's range with the boxes at its ends.";
+    if (setType_ == SetType::Julia) {
+        hint = "Scroll over the image to zoom; right-drag to pan.\nJulia c is the constant in z = z^2 + c.\n"
+            "Set each slider's range with the boxes at its ends.";
+    } else if (setType_ == SetType::Lyapunov) {
+        hint = "x = r x (1 - x), with r = a or b following the\nsequence. Gold is stable, blue is chaotic.\n"
+            "Try AB, AABAB or BBBBBBAAAAAA.";
+    }
+    SetWindowTextA(hintLabel_, hint);
+    for (int field = centreRealField; field <= iterationsField; ++field) {
+        SetWindowTextA(fieldLabels_[field], fieldLabel(field));
+    }
     positionMenuControls();
 }
 
@@ -484,16 +530,29 @@ void Visualiser::positionMenuControls() {
     };
 
     place(titleLabel_, offsetRect(RECT{contentLeft, titleTop, contentRight, titleTop + lineHeight_ + 8}, dy));
-    const int segmentWidth = (contentRight - contentLeft) / 2;
+    const int segmentWidth = (contentRight - contentLeft) / 3;
     place(mandelbrotButton_, offsetRect(RECT{contentLeft, selectorTop, contentLeft + segmentWidth,
         selectorTop + selectorHeight}, dy));
-    place(juliaButton_, offsetRect(RECT{contentLeft + segmentWidth, selectorTop, contentRight,
+    place(juliaButton_, offsetRect(RECT{contentLeft + segmentWidth, selectorTop, contentLeft + 2 * segmentWidth,
+        selectorTop + selectorHeight}, dy));
+    place(lyapunovButton_, offsetRect(RECT{contentLeft + 2 * segmentWidth, selectorTop, contentRight,
         selectorTop + selectorHeight}, dy));
 
     const bool mandelbrot = setType_ == SetType::Mandelbrot;
     ShowWindow(formulaLabel_, mandelbrot ? SW_SHOW : SW_HIDE);
     const int headingTop = formulaHeadingTop() + dy;
     place(formulaLabel_, RECT{contentLeft, headingTop + 6, contentRight, headingTop + 6 + lineHeight_ + 2});
+
+    const bool lyapunov = setType_ == SetType::Lyapunov;
+    ShowWindow(colouringLabel_, lyapunov ? SW_HIDE : SW_SHOW);
+    ShowWindow(smoothButton_, lyapunov ? SW_HIDE : SW_SHOW);
+    ShowWindow(bandsButton_, lyapunov ? SW_HIDE : SW_SHOW);
+    ShowWindow(sequenceLabel_, lyapunov ? SW_SHOW : SW_HIDE);
+    ShowWindow(sequenceInput_, lyapunov ? SW_SHOW : SW_HIDE);
+    const RECT sequenceBox = offsetRect(sequenceBoxRect(), dy);
+    const int sequenceLabelTop = sequenceBox.top + (boxHeight - lineHeight_) / 2;
+    place(sequenceLabel_, RECT{contentLeft, sequenceLabelTop, boxLeft - 8, sequenceLabelTop + lineHeight_ + 2});
+    placeEdit(sequenceInput_, sequenceBox);
 
     const int colouringTop = colouringRowTop() + dy;
     const int colouringLabelTop = colouringTop + (boxHeight - lineHeight_) / 2;
@@ -579,6 +638,9 @@ void Visualiser::paintMenu(HDC deviceContext) {
         drawBox(maximumBoxRect(field), maximumInputs_[field]);
     }
 
+    if (setType_ == SetType::Lyapunov) {
+        drawBox(sequenceBoxRect(), sequenceInput_);
+    }
     if (setType_ == SetType::Mandelbrot) {
         // A rule above the formula heading separates the formula constants from the view.
         const int ruleTop = formulaHeadingTop() + dy - 4;
@@ -594,8 +656,10 @@ void Visualiser::drawButton(const DRAWITEMSTRUCT& item) {
     const RECT bounds = item.rcItem;
     FillRect(deviceContext, &bounds, panelBrush_);
 
-    if (item.hwndItem == mandelbrotButton_ || item.hwndItem == juliaButton_) {
-        drawToggleButton(item, (item.hwndItem == mandelbrotButton_) == (setType_ == SetType::Mandelbrot));
+    if (item.hwndItem == mandelbrotButton_ || item.hwndItem == juliaButton_ || item.hwndItem == lyapunovButton_) {
+        const HWND selected = setType_ == SetType::Julia ? juliaButton_
+            : setType_ == SetType::Lyapunov ? lyapunovButton_ : mandelbrotButton_;
+        drawToggleButton(item, item.hwndItem == selected);
         return;
     }
     if (item.hwndItem == smoothButton_ || item.hwndItem == bandsButton_) {
@@ -638,7 +702,7 @@ void Visualiser::drawButton(const DRAWITEMSTRUCT& item) {
     }
 }
 
-// One half of a two-way switch (Mandelbrot | Julia, Smooth | Bands). The selected half is filled
+// One part of a switch (Mandelbrot | Julia | Lyapunov, Smooth | Bands). The selected part is filled
 // and underlined.
 void Visualiser::drawToggleButton(const DRAWITEMSTRUCT& item, bool selected) {
     HDC deviceContext = item.hDC;
@@ -716,6 +780,9 @@ Visualiser::SliderRange& Visualiser::range(int field) {
 
 Visualiser::SliderRange Visualiser::defaultRange(SetType type, int field) {
     const bool julia = type == SetType::Julia;
+    if (type == SetType::Lyapunov && (field == centreRealField || field == centreImaginaryField)) {
+        return SliderRange{0.0, 4.0};
+    }
     switch (field) {
     case centreRealField: return julia ? SliderRange{-2.0, 2.0} : SliderRange{-2.0, 1.0};
     case centreImaginaryField: return julia ? SliderRange{-2.0, 2.0} : SliderRange{-1.5, 1.5};
@@ -726,8 +793,22 @@ Visualiser::SliderRange Visualiser::defaultRange(SetType type, int field) {
     case juliaRealField: return SliderRange{-2.0, 1.0};
     case juliaImaginaryField: return SliderRange{-1.5, 1.5};
     case exponentField: return SliderRange{1.0, 8.0};
+    case warmupField: return SliderRange{1.0, 2000.0};
     default: return SliderRange{-2.0, 2.0};  // Formula constants a, c and z0.
     }
+}
+
+// The centre fields are a and b rather than real and imaginary parts for the Lyapunov fractal.
+const char* Visualiser::fieldLabel(int field) const {
+    if (setType_ == SetType::Lyapunov) {
+        switch (field) {
+        case centreRealField: return "Centre a";
+        case centreImaginaryField: return "Centre b";
+        case iterationsField: return "Iterations";
+        default: break;
+        }
+    }
+    return fieldInfo[field].label;
 }
 
 double Visualiser::fieldValue(int field) const {
@@ -746,6 +827,7 @@ double Visualiser::fieldValue(int field) const {
     case cRealField: return view_.formula.cReal;
     case cImaginaryField: return view_.formula.cImaginary;
     case startRealField: return view_.formula.startReal;
+    case warmupField: return view_.warmup;
     default: return view_.formula.startImaginary;
     }
 }
@@ -768,6 +850,9 @@ void Visualiser::setFieldValue(int field, double value) {
     case cRealField: view_.formula.cReal = value; break;
     case cImaginaryField: view_.formula.cImaginary = value; break;
     case startRealField: view_.formula.startReal = value; break;
+    case warmupField:
+        view_.warmup = static_cast<int>(std::lround(std::max(1.0, std::min(value, 100000.0))));
+        break;
     default: view_.formula.startImaginary = value; break;
     }
 }
@@ -782,6 +867,7 @@ bool Visualiser::parseField(int field, double& value) const {
     case iterationsField: return value >= 1.0 && value <= 1000000.0 && value == std::floor(value);
     case escapeRadiusField: return value > 0.0;
     case colourCycleField: return value > 0.0;
+    case warmupField: return value >= 1.0 && value <= 100000.0 && value == std::floor(value);
     default: return true;
     }
 }
@@ -841,6 +927,36 @@ void Visualiser::onRangeEdited(int field) {
     InvalidateRect(sliders_[field], nullptr, FALSE);
 }
 
+// A valid sequence is a non-empty string of As and Bs (the box makes them upper case).
+bool Visualiser::parseSequence(std::string& sequence) const {
+    char text[maximumSequenceLength + 1]{};
+    GetWindowTextA(sequenceInput_, text, sizeof(text));
+    sequence.clear();
+    for (const char* letter = text; *letter != '\0'; ++letter) {
+        if (*letter == 'A' || *letter == 'B') {
+            sequence += *letter;
+        } else if (*letter != ' ') {
+            return false;
+        }
+    }
+    return !sequence.empty();
+}
+
+void Visualiser::onSequenceEdited() {
+    std::string sequence;
+    if (writingInputs_ || !parseSequence(sequence) || sequence == view_.sequence) {
+        return;
+    }
+    view_.sequence = sequence;
+    requestRender();
+}
+
+void Visualiser::writeSequence() {
+    writingInputs_ = true;
+    SetWindowTextA(sequenceInput_, view_.sequence.c_str());
+    writingInputs_ = false;
+}
+
 // Validates every visible field (for the Render button), reporting the first problem.
 bool Visualiser::readInputs() {
     const char* problems[] = {
@@ -859,14 +975,28 @@ bool Visualiser::readInputs() {
         "c imaginary must be a number.",
         "Start z0 real must be a number.",
         "Start z0 imaginary must be a number.",
+        "Warm-up must be a whole number from 1 to 100000.",
     };
     double values[fieldCount] = {};
     for (int field = 0; field < fieldCount; ++field) {
         if (isFieldVisible(field) && !parseField(field, values[field])) {
-            setStatus(problems[field]);
+            if (setType_ == SetType::Lyapunov && field <= centreImaginaryField) {
+                setStatus(field == centreRealField ? "Centre a must be a number." : "Centre b must be a number.");
+            } else {
+                setStatus(problems[field]);
+            }
             SetFocus(valueInputs_[field]);
             return false;
         }
+    }
+    if (setType_ == SetType::Lyapunov) {
+        std::string sequence;
+        if (!parseSequence(sequence)) {
+            setStatus("The sequence can only contain the letters A and B.");
+            SetFocus(sequenceInput_);
+            return false;
+        }
+        view_.sequence = sequence;
     }
     for (int field = 0; field < fieldCount; ++field) {
         if (!isFieldVisible(field)) {
@@ -883,6 +1013,12 @@ Visualiser::View Visualiser::defaultView(SetType type) {
     if (type == SetType::Julia) {
         view.centerReal = 0.0;
         view.centerImaginary = 0.0;
+    } else if (type == SetType::Lyapunov) {
+        // Most of the interesting structure is in 2 <= a, b <= 4.
+        view.centerReal = 3.0;
+        view.centerImaginary = 3.0;
+        view.zoom = 2.0;
+        view.maxIterations = 600;
     }
     return view;
 }
@@ -901,7 +1037,8 @@ void Visualiser::switchSet(SetType type) {
         writeRange(field);
     }
     layoutMenu();
-    setStatus(setType_ == SetType::Julia ? "Julia set selected." : "Mandelbrot set selected.");
+    setStatus(setType_ == SetType::Julia ? "Julia set selected."
+        : setType_ == SetType::Lyapunov ? "Lyapunov fractal selected." : "Mandelbrot set selected.");
     requestRender();
 }
 
@@ -952,6 +1089,7 @@ void Visualiser::writeInputs() {
     for (int field = 0; field < fieldCount; ++field) {
         writeField(field);
     }
+    writeSequence();
 }
 
 void Visualiser::writePositionInputs() {
@@ -1049,13 +1187,20 @@ void Visualiser::renderThreadLoop() {
         bool reuseCoarser = false;
         for (; step >= 1; step /= 2) {
             const View& view = request.view;
-            const bool rendered = request.type == SetType::Mandelbrot
-                ? calculator_.renderMandelbrot(buffer, request.width, request.height, view.centerReal,
+            bool rendered = false;
+            if (request.type == SetType::Mandelbrot) {
+                rendered = calculator_.renderMandelbrot(buffer, request.width, request.height, view.centerReal,
                     view.centerImaginary, view.zoom, view.maxIterations, view.escapeRadius, view.formula,
-                    view.colouring, &cancelRender_, step, reuseCoarser)
-                : calculator_.renderJulia(buffer, request.width, request.height, view.centerReal,
+                    view.colouring, &cancelRender_, step, reuseCoarser);
+            } else if (request.type == SetType::Julia) {
+                rendered = calculator_.renderJulia(buffer, request.width, request.height, view.centerReal,
                     view.centerImaginary, view.zoom, view.juliaReal, view.juliaImaginary,
                     view.maxIterations, view.escapeRadius, view.colouring, &cancelRender_, step, reuseCoarser);
+            } else {
+                rendered = calculator_.renderLyapunov(buffer, request.width, request.height, view.centerReal,
+                    view.centerImaginary, view.zoom, view.sequence, view.warmup, view.maxIterations,
+                    &cancelRender_, step, reuseCoarser);
+            }
             if (!rendered) {
                 break;  // A newer request arrived; the loop picks it up straight away.
             }
@@ -1514,6 +1659,18 @@ LRESULT Visualiser::handleWindowMessage(UINT message, WPARAM wParam, LPARAM lPar
             }
             return 0;
         }
+        if (id == sequenceInputId) {
+            if (code == EN_CHANGE) {
+                onSequenceEdited();
+            } else if (code == EN_SETFOCUS) {
+                scrollMenuToShow(sequenceBoxRect());
+                invalidateMenuArea(sequenceBoxRect());
+            } else if (code == EN_KILLFOCUS) {
+                writeSequence();  // Put back the last valid sequence.
+                invalidateMenuArea(sequenceBoxRect());
+            }
+            return 0;
+        }
         if (code != BN_CLICKED) {
             return 0;
         }
@@ -1521,6 +1678,8 @@ LRESULT Visualiser::handleWindowMessage(UINT message, WPARAM wParam, LPARAM lPar
             switchSet(SetType::Mandelbrot);
         } else if (id == juliaButtonId) {
             switchSet(SetType::Julia);
+        } else if (id == lyapunovButtonId) {
+            switchSet(SetType::Lyapunov);
         } else if (id == smoothButtonId || id == bandsButtonId) {
             view_.colouring.smooth = id == smoothButtonId;
             InvalidateRect(smoothButton_, nullptr, FALSE);
